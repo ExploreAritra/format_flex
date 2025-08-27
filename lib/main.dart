@@ -255,7 +255,7 @@ class FfmpegService {
     int? durationMs;
     final d = double.tryParse(info.getDuration() ?? '');
     if (d != null) durationMs = (d * 1000).round();
-    final streams = info.getStreams();
+    final streams = info.getStreams() ?? []; // <-- null-safe
     final hasHdr = _hasHdrColor(streams);
     return MediaProbeResult(durationMs: durationMs, hasHdr: hasHdr);
   }
@@ -349,7 +349,7 @@ class FfmpegService {
       ...vArgs,
       ...aArgs,
       ...movFlags,
-      '"$output"',
+      output.startsWith('saf:') ? output : '"$output"',
     ];
     return args.join(' ');
   }
@@ -361,7 +361,16 @@ class FfmpegService {
     required void Function(String status) onError,
     void Function(int id)? onSession,
   }) async {
+    // capture FFmpeg logs (keep last ~200 lines)
+    final List<String> _tail = [];
+    FFmpegKitConfig.enableLogCallback((log) {
+      final line = log.getMessage() ?? '';
+      _tail.add(line);
+      if (_tail.length > 200) _tail.removeAt(0);
+    });
+
     FFmpegKitConfig.enableStatisticsCallback((Statistics s) => onProgress(_pct(s)));
+
     final session = await FFmpegKit.executeAsync(
       cmd,
           (session) async {
@@ -371,12 +380,15 @@ class FfmpegService {
         } else if (ReturnCode.isCancel(rc)) {
           onError('Cancelled');
         } else {
-          onError('Failed (code ${rc?.getValue()})');
+          // include the last lines in status for easier diagnosis from UI/logcat
+          final lastLines = _tail.skip(_tail.length > 80 ? _tail.length - 80 : 0).join('\n');
+          onError('Failed (code ${rc?.getValue()})\n$lastLines');
         }
       },
     );
     onSession?.call(session.getSessionId() ?? 0);
   }
+
 
   double _pct(Statistics s) {
     // We cannot know duration here; UI maps it when available. Returning 0..1 when time is known.
@@ -430,6 +442,8 @@ class _ConverterHomeState extends State<ConverterHome> {
   int? _durationMs;
   int? _sessionId;
   bool _busy = false; // NEW: disable controls while converting
+  String? _safWriteUri; // keeps SAF output URI so we can refresh 'saf:' path on retries
+
 
   ConvertOptions opts = ConvertOptions()..applyPreset(kPresets[1]);
 
@@ -479,6 +493,34 @@ class _ConverterHomeState extends State<ConverterHome> {
     });
   }
 
+  Future<bool> _ensureOutputDirWritable(String fullPath) async {
+    try {
+      final parent = Directory(p.dirname(fullPath));
+      if (!await parent.exists()) await parent.create(recursive: true);
+      final probeFile = File(p.join(parent.path, '.ff_out_test'));
+      await probeFile.writeAsString('ok');
+      await probeFile.delete();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<String?> _pickSafOutputFile(String suggestedName) async {
+    try {
+      final uri = await FFmpegKitConfig.selectDocumentForWrite(
+        suggestedName.isEmpty ? 'output.${opts.container.ext}' : suggestedName,
+        'video/*',
+      );
+      if (uri == null) return null;
+      _safWriteUri = uri; // <-- remember it for retries
+      final safUrl = await FFmpegKitConfig.getSafParameterForWrite(uri);
+      return safUrl; // e.g., "saf:3"
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<void> _convert() async {
     if (opts.input.isEmpty) return;
     if ((opts.outputDir ?? '').isEmpty || opts.outputFileName.isEmpty) {
@@ -493,32 +535,140 @@ class _ConverterHomeState extends State<ConverterHome> {
 
     setState(() { _status = 'Probing…'; _progress = 0; _durationMs = null; _busy = true; });
 
+    // Probe input
     final probe = await _svc.probe(opts.input);
     _durationMs = probe.durationMs;
 
-    final cmd = _svc.buildCommand(
+    // Decide output target: try direct path; if not writable on Android, fall back to SAF
+    String outTarget = opts.computedOutputPath();
+    bool needSaf = false;
+
+    final writable = await _ensureOutputDirWritable(outTarget);
+    if (!writable && Platform.isAndroid) {
+      needSaf = true;
+    } else if (!writable) {
+      setState(() { _status = 'Output folder not writable.'; _busy = false; });
+      return;
+    }
+
+    if (needSaf) {
+      setState(() => _status = 'Choose output file (Android Storage Access Framework)…');
+      final safUrl = await _pickSafOutputFile(opts.outputFileName);
+      if (safUrl == null) {
+        setState(() { _status = 'Output not selected'; _busy = false; });
+        return;
+      }
+      outTarget = safUrl; // use SAF output (e.g., "saf:3")
+    }
+
+    String buildCmd() => _svc.buildCommand(
       input: opts.input,
-      output: opts.computedOutputPath(),
+      output: outTarget,
       hasHdr: probe.hasHdr,
       o: opts,
     );
 
-    setState(() => _status = 'Converting…');
+    Future<void> runOnce(String command) async {
+      setState(() => _status = 'Converting…');
+      await _svc.convert(
+        cmd: command,
+        onProgress: (rawSec) {
+          if (_durationMs == null || _durationMs == 0) return;
+          final pct = (rawSec * 1000) / _durationMs!;
+          setState(() => _progress = pct.clamp(0.0, 1.0));
+        },
+        onDone: (msg) => setState(() {
+          _status = 'Done: $outTarget';
+          _progress = 1.0;
+          _busy = false;
+        }),
+        onError: (msg) async {
+          // If HW encoder failed, retry once in software
+          final lower = msg.toLowerCase();
+          final hw = opts.useHwEncoder;
+          final looksHwFail =
+              lower.contains('mediacodec') ||
+                  (lower.contains('encoder') && lower.contains('not found')) ||
+                  lower.contains('configure');
 
-    await _svc.convert(
-      cmd: cmd,
-      onProgress: (rawSec) {
-        if (_durationMs == null || _durationMs == 0) return;
-        final pct = (rawSec * 1000) / _durationMs!;
-        setState(() => _progress = pct.clamp(0.0, 1.0));
-      },
-      onDone: (msg) => setState(() { _status = 'Done: ${opts.computedOutputPath()}'; _progress = 1.0; _busy = false; }),
-      onError: (msg) => setState(() { _status = msg; _busy = false; }),
-      onSession: (id) => _sessionId = id,
-    );
+          if (hw && looksHwFail) {
+            setState(() => _status = 'HW encoder failed, retrying with software…');
+            opts.useHwEncoder = false;
+
+            // IMPORTANT: if we’re writing to SAF, refresh the 'saf:' parameter for the retry
+            if (outTarget.startsWith('saf:')) {
+              if (_safWriteUri != null) {
+                try {
+                  final refreshed = await FFmpegKitConfig.getSafParameterForWrite(_safWriteUri!);
+                  if (refreshed != null) outTarget = refreshed;
+                } catch (_) { /* ignore, will try repick below if still failing */ }
+              }
+            }
+
+            final swCmd = buildCmd();
+            _svc.convert(
+              cmd: swCmd,
+              onProgress: (raw2) {
+                if (_durationMs == null || _durationMs == 0) return;
+                final pct2 = (raw2 * 1000) / _durationMs!;
+                setState(() => _progress = pct2.clamp(0.0, 1.0));
+              },
+              onDone: (msg2) => setState(() {
+                _status = 'Done: $outTarget';
+                _progress = 1.0;
+                _busy = false;
+              }),
+              onError: (msg2) async {
+                // As a last resort: if SAF handle still missing, ask the user again once
+                if (outTarget.startsWith('saf:') && msg2.toLowerCase().contains('saf id') ) {
+                  setState(() => _status = 'Output handle expired. Pick output again…');
+                  final repick = await _pickSafOutputFile(opts.outputFileName);
+                  if (repick != null) {
+                    outTarget = repick;
+                    final retryCmd = buildCmd();
+                    _svc.convert(
+                      cmd: retryCmd,
+                      onProgress: (raw3) {
+                        if (_durationMs == null || _durationMs == 0) return;
+                        final pct3 = (raw3 * 1000) / _durationMs!;
+                        setState(() => _progress = pct3.clamp(0.0, 1.0));
+                      },
+                      onDone: (msg3) => setState(() {
+                        _status = 'Done: $outTarget';
+                        _progress = 1.0;
+                        _busy = false;
+                      }),
+                      onError: (msg3) => setState(() { _status = msg3; _busy = false; }),
+                      onSession: (id3) => _sessionId = id3,
+                    );
+                    return;
+                  }
+                }
+                setState(() { _status = msg2; _busy = false; });
+              },
+              onSession: (id2) => _sessionId = id2,
+            );
+          } else {
+            setState(() {
+              _status = msg;
+              _busy = false;
+            });
+          }
+        },
+        onSession: (id) => _sessionId = id,
+      );
+    }
+
+    final cmd = buildCmd();
+    await runOnce(cmd);
   }
 
-  Future<void> _cancel() async { if (_sessionId != null) { await FFmpegKit.cancel(_sessionId!); } setState(() { _busy = false; }); }
+  Future<void> _cancel() async {
+    if (_sessionId != null) {
+      await FFmpegKit.cancel(_sessionId!);
+    }
+    setState(() { _busy = false; });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -527,7 +677,7 @@ class _ConverterHomeState extends State<ConverterHome> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('Universal Video Converter'),
-        actions: [IconButton(onPressed: _busy ? _cancel : null, icon: const Icon(Icons.close))],
+        actions: [IconButton(onPressed: _busy ? () { _cancel(); } : null, icon: const Icon(Icons.close))],
       ),
       body: ListView(
         controller: _scroll,
@@ -538,7 +688,7 @@ class _ConverterHomeState extends State<ConverterHome> {
           LinearProgressIndicator(value: _progress == 0 ? null : _progress),
           const SizedBox(height: 16),
           Row(children: [
-            Expanded(child: FilledButton.icon(onPressed: _busy ? null : _pickInput, icon: const Icon(Icons.video_file), label: const Text('Pick Video'))),
+            Expanded(child: FilledButton.icon(onPressed: _busy ? null : () => _pickInput(), icon: const Icon(Icons.video_file), label: const Text('Pick Video'))),
           ]),
           const SizedBox(height: 16),
           if (opts.input.isNotEmpty)
@@ -555,7 +705,7 @@ class _ConverterHomeState extends State<ConverterHome> {
               ),
             ),
             const SizedBox(width: 8),
-            FilledButton.tonal(onPressed: _busy ? null : _chooseOutputFolder, child: const Text('Choose…')),
+            FilledButton.tonal(onPressed: _busy ? null : () => _chooseOutputFolder(), child: const Text('Choose…')),
           ]),
           const SizedBox(height: 12),
           TextField(
@@ -682,7 +832,7 @@ class _ConverterHomeState extends State<ConverterHome> {
 
           const SizedBox(height: 16),
           Row(children: [
-            Expanded(child: FilledButton.icon(onPressed: (!canConvert || _busy) ? null : _convert, icon: const Icon(Icons.play_arrow), label: const Text('Convert'))),
+            Expanded(child: FilledButton.icon(onPressed: (!canConvert || _busy) ? null : () => _convert(), icon: const Icon(Icons.play_arrow), label: const Text('Convert'))),
           ]),
           const SizedBox(height: 24),
           const _TipsBox(),
