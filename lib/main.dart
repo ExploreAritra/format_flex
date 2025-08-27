@@ -362,11 +362,11 @@ class FfmpegService {
     void Function(int id)? onSession,
   }) async {
     // capture FFmpeg logs (keep last ~200 lines)
-    final List<String> _tail = [];
+    final List<String> tail = [];
     FFmpegKitConfig.enableLogCallback((log) {
       final line = log.getMessage() ?? '';
-      _tail.add(line);
-      if (_tail.length > 200) _tail.removeAt(0);
+      tail.add(line);
+      if (tail.length > 200) tail.removeAt(0);
     });
 
     FFmpegKitConfig.enableStatisticsCallback((Statistics s) => onProgress(_pct(s)));
@@ -381,7 +381,7 @@ class FfmpegService {
           onError('Cancelled');
         } else {
           // include the last lines in status for easier diagnosis from UI/logcat
-          final lastLines = _tail.skip(_tail.length > 80 ? _tail.length - 80 : 0).join('\n');
+          final lastLines = tail.skip(tail.length > 80 ? tail.length - 80 : 0).join('\n');
           onError('Failed (code ${rc?.getValue()})\n$lastLines');
         }
       },
