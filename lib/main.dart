@@ -1104,7 +1104,7 @@ class _ConverterHomeState extends State<ConverterHome> {
         _status = msg;
         _busy = false;
       });
-      log(msg, name: 'FFmpegKit', level: 2000);
+      log(msg, name: 'FFmpegKit');
     }
 
     WakelockPlus.disable();
