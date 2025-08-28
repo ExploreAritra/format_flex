@@ -19,6 +19,8 @@ dependencies:
   # Use the FULL GPL build (includes x264/x265, filters, etc.)
   ffmpeg_kit_flutter_new: ^3.2.0
   wakelock_plus: ^1.3.2
+  media_store_plus: ^0.1.3
+  flutter_foreground_task: ^9.1.0
 
 dev_dependencies:
   flutter_test:
