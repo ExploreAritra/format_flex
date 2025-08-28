@@ -1,10 +1,3 @@
-// pubspec.yaml (add these):
-// dependencies:
-//   flutter: {sdk: flutter}
-//   file_picker: ^8.0.3
-//   path: ^1.9.0
-//   path_provider: ^2.1.4
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -15,7 +8,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 // -------------------------------------------------------------
-// Models, enums, presets (mostly identical to your Android code)
+// Models, enums, presets
 // -------------------------------------------------------------
 
 enum ContainerFmt { mp4, mkv, webm }
@@ -227,7 +220,7 @@ class ConvertOptions {
   bool useHwEncoder = false;
   bool turbo = false;
 
-  // Optional: set to a custom folder containing ffmpeg.exe/ffprobe.exe
+  // Optional: folder containing ffmpeg.exe/ffprobe.exe
   String? ffmpegDir;
 
   void applyPreset(Preset p) {
@@ -255,7 +248,7 @@ class ConvertOptions {
 }
 
 // -------------------------------------------------------------
-// Low-level: FFmpeg paths and GPU capability discovery
+// FFmpeg paths and GPU capability discovery
 // -------------------------------------------------------------
 
 class FfmpegBins {
@@ -280,11 +273,15 @@ class GpuCaps {
   final Set<String> encoders = {};
   final Set<String> filters = {};
 
-  bool get hasNVENC => encoders.contains('h264_nvenc') || encoders.contains('hevc_nvenc') || encoders.contains('av1_nvenc');
-  bool get hasQSV => encoders.contains('h264_qsv') || encoders.contains('hevc_qsv') || encoders.contains('av1_qsv') || encoders.contains('vp9_qsv');
-  bool get hasAMF => encoders.contains('h264_amf') || encoders.contains('hevc_amf') || encoders.contains('av1_amf');
+  bool get hasNVENC =>
+      encoders.contains('h264_nvenc') || encoders.contains('hevc_nvenc') || encoders.contains('av1_nvenc');
+  bool get hasQSV =>
+      encoders.contains('h264_qsv') || encoders.contains('hevc_qsv') || encoders.contains('av1_qsv') || encoders.contains('vp9_qsv');
+  bool get hasAMF =>
+      encoders.contains('h264_amf') || encoders.contains('hevc_amf') || encoders.contains('av1_amf');
 
   bool get hasScaleCuda => filters.contains('scale_cuda') || filters.contains('scale_npp');
+  bool get hasScaleQsv  => filters.contains('scale_qsv');
   bool get hasTonemapOpenCL => filters.contains('tonemap_opencl');
 
   static Future<GpuCaps> probe(FfmpegBins bins) async {
@@ -300,10 +297,8 @@ class GpuCaps {
       }
       if (f.exitCode == 0) {
         for (final line in LineSplitter.split(f.stdout.toString())) {
-          final parts = line.trim().split(RegExp(r'\s+'));
-          if (parts.isNotEmpty && !parts.first.startsWith('T.')) {
-            caps.filters.add(parts.first);
-          }
+          final name = line.trim().split(RegExp(r'\s+')).first;
+          if (name.isNotEmpty) caps.filters.add(name);
         }
       }
     } catch (_) {}
@@ -326,7 +321,17 @@ class MediaProbeResult {
   final int? aChannels;
   final int? aSampleRate;
 
-  MediaProbeResult({required this.durationMs, required this.hasHdr, this.width, this.height, this.vCodecName, this.pixFmt, this.aCodecName, this.aChannels, this.aSampleRate});
+  MediaProbeResult({
+    required this.durationMs,
+    required this.hasHdr,
+    this.width,
+    this.height,
+    this.vCodecName,
+    this.pixFmt,
+    this.aCodecName,
+    this.aChannels,
+    this.aSampleRate,
+  });
 }
 
 class ConvertResult {
@@ -337,16 +342,22 @@ class ConvertResult {
   ConvertResult({required this.ok, required this.cancelled, required this.returnCode, required this.tailLog});
 }
 
+// -------------------------------------------------------------
+// FFmpeg service (Windows)
+// -------------------------------------------------------------
+
 class FfmpegServiceWin {
   FfmpegServiceWin(this.bins, this.caps);
   final FfmpegBins bins;
   final GpuCaps caps;
 
   Future<MediaProbeResult> probe(String inputPath) async {
-    final pr = await Process.run(bins.ffprobe, ['-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', inputPath]);
-    if (pr.exitCode != 0) {
-      return MediaProbeResult(durationMs: null, hasHdr: false);
-    }
+    final pr = await Process.run(
+      bins.ffprobe,
+      ['-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', inputPath],
+    );
+    if (pr.exitCode != 0) return MediaProbeResult(durationMs: null, hasHdr: false);
+
     final json = jsonDecode(pr.stdout.toString());
     final streams = (json['streams'] as List<dynamic>? ?? []);
     double? durSec;
@@ -356,6 +367,7 @@ class FfmpegServiceWin {
     int? w, h, ch, sr;
     String? vCodec, aCodec, pix;
     bool hasHdr = false;
+
     for (final s in streams) {
       final type = (s['codec_type'] ?? '').toString();
       if (type == 'video') {
@@ -410,7 +422,25 @@ class FfmpegServiceWin {
     return v.swName; // fallback software encoder
   }
 
-  String buildCommand({
+  int _even(int v) => (v & ~1); // nearest even <= v
+
+  ({int w, int h}) bestFitSize({
+    required int srcW,
+    required int srcH,
+    required int maxW,
+    required int maxH,
+  }) {
+    if (srcW <= 0 || srcH <= 0) return (w: maxW, h: maxH);
+    final sw = maxW / srcW;
+    final sh = maxH / srcH;
+    final s = (sw < sh) ? sw : sh; // fit into box
+    final tw = _even((srcW * s).floor());
+    final th = _even((srcH * s).floor());
+    return (w: tw.clamp(2, maxW), h: th.clamp(2, maxH));
+  }
+
+  /// Build ffmpeg argv list (no shell quoting).
+  List<String> buildCommand({
     required String input,
     required String output,
     required MediaProbeResult probe,
@@ -418,69 +448,102 @@ class FfmpegServiceWin {
     bool forceSoftwareDecode = false,
     bool forceSoftwareEncode = false,
   }) {
-    final bool turbo = o.turbo;
-    final bool wantToneMap = turbo ? false : (o.toneMapHdrToSdr && probe.hasHdr);
+    final turbo = o.turbo;
+    final hdrToneMapRequested = o.toneMapHdrToSdr && probe.hasHdr && !turbo;
+
     final knowSize = (probe.width != null && probe.height != null);
     final needsScale = knowSize ? (probe.width! > o.resolution.w || probe.height! > o.resolution.h) : false;
+    final srcW = probe.width ?? 0;
+    final srcH = probe.height ?? 0;
+    final target = needsScale
+        ? bestFitSize(srcW: srcW, srcH: srcH, maxW: o.resolution.w, maxH: o.resolution.h)
+        : (w: srcW, h: srcH);
 
     final VCodec effV = turbo ? VCodec.h264 : o.vcodec;
     final encName = forceSoftwareEncode ? effV.swName : pickEncoder(effV, requestHw: o.useHwEncoder || turbo);
 
-    final String vCodecIn = (probe.vCodecName ?? '').toLowerCase();
-    final bool sameCodec =
+    final vCodecIn = (probe.vCodecName ?? '').toLowerCase();
+    final sameCodec =
         (effV == VCodec.h264 && vCodecIn.contains('h264')) ||
-        (effV == VCodec.hevc && (vCodecIn.contains('hevc') || vCodecIn.contains('h265'))) ||
-        (effV == VCodec.vp9 && vCodecIn.contains('vp9')) ||
-        (effV == VCodec.av1 && vCodecIn.contains('av1'));
+            (effV == VCodec.hevc && (vCodecIn.contains('hevc') || vCodecIn.contains('h265'))) ||
+            (effV == VCodec.vp9 && vCodecIn.contains('vp9')) ||
+            (effV == VCodec.av1 && vCodecIn.contains('av1'));
 
     final pixOk = (probe.pixFmt == null) || probe.pixFmt!.contains('yuv420');
-    final canCopyVideo = !wantToneMap && !needsScale && (turbo ? true : (o.fps == null)) && sameCodec && pixOk;
+    final canCopyVideo = !hdrToneMapRequested && !needsScale && (turbo ? true : (o.fps == null)) && sameCodec && pixOk;
 
-    final String aCodecIn = (probe.aCodecName ?? '').toLowerCase();
-    final bool sameAudio =
+    final aCodecIn = (probe.aCodecName ?? '').toLowerCase();
+    final sameAudio =
         (o.acodec == ACodec.aac && aCodecIn == 'aac') ||
-        (o.acodec == ACodec.ac3 && aCodecIn == 'ac3') ||
-        (o.acodec == ACodec.eac3 && aCodecIn == 'eac3') ||
-        (o.acodec == ACodec.opus && aCodecIn == 'opus') ||
-        (o.acodec == ACodec.mp3 && aCodecIn == 'mp3');
-    final bool canCopyAudio = sameAudio && (probe.aChannels == null || probe.aChannels == o.audioChannels) && (probe.aSampleRate == null || probe.aSampleRate == o.sampleRate);
+            (o.acodec == ACodec.ac3 && aCodecIn == 'ac3') ||
+            (o.acodec == ACodec.eac3 && aCodecIn == 'eac3') ||
+            (o.acodec == ACodec.opus && aCodecIn == 'opus') ||
+            (o.acodec == ACodec.mp3 && aCodecIn == 'mp3');
+    final canCopyAudio = sameAudio &&
+        (probe.aChannels == null || probe.aChannels == o.audioChannels) &&
+        (probe.aSampleRate == null || probe.aSampleRate == o.sampleRate);
 
-    // ------------------ Filter chain (tone-map & scale) ------------------
+    // ---------- Filters ----------
     final vf = <String>[];
-    // We keep CPU tonemap by default (stable everywhere). If OpenCL tonemap exists, we could switch to it later.
-    if (wantToneMap) {
+    final preGlobal = <String>[]; // e.g., -init_hw_device opencl=ocl -filter_hw_device ocl
+    final usingHwEnc = !encName.startsWith('lib');
+
+    // Tone-map strategy
+    final useOpenCLToneMap = hdrToneMapRequested && caps.hasTonemapOpenCL;
+
+    // Prefer vendor scaling when staying on one GPU path
+    final wantVendorScale = needsScale && usingHwEnc && !useOpenCLToneMap;
+    final useScaleCuda = wantVendorScale && encName.contains('_nvenc') && caps.hasScaleCuda;
+    final useScaleQsv  = wantVendorScale && encName.contains('_qsv')   && caps.hasScaleQsv;
+
+    // 1) Tone-map chain
+    if (useOpenCLToneMap) {
+      preGlobal.addAll(['-init_hw_device', 'opencl=ocl', '-filter_hw_device', 'ocl']);
+      vf.addAll([
+        'format=p010le',
+        'hwupload',
+        'tonemap_opencl=tonemap=hable:desat=0',
+        'hwdownload',
+        'format=yuv420p',
+      ]);
+    } else if (hdrToneMapRequested) {
       vf.add('zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable,zscale=p=bt709:t=bt709:m=bt709,format=yuv420p');
     }
+
+    // 2) Scaling chain
     if (needsScale) {
-      vf.add('scale=w=${o.resolution.w}:h=${o.resolution.h}:flags=fast_bilinear:force_original_aspect_ratio=decrease');
+      if (useOpenCLToneMap) {
+        vf.add('scale=w=${target.w}:h=${target.h}:flags=fast_bilinear');
+      } else if (useScaleCuda) {
+        vf.add('scale_cuda=w=${target.w}:h=${target.h}');
+      } else if (useScaleQsv) {
+        vf.add('scale_qsv=w=${target.w}:h=${target.h}');
+      } else {
+        vf.add('scale=w=${target.w}:h=${target.h}:flags=fast_bilinear');
+      }
     }
+
     final vfChain = vf.isEmpty ? null : vf.join(',');
 
-    // ------------------ Decoder side ------------------
+    // ---------- Decoder side (opportunistic) ----------
     final preInput = <String>[];
-    final usingHwEnc = !encName.startsWith('lib'); // we selected a HW encoder
-    // Use HW decode opportunistically only when we are not forcing software decode and have HW encoder (best end-to-end).
-    if (!forceSoftwareDecode && usingHwEnc && !wantToneMap && !needsScale) {
-      // zero-copy path most likely when no filters are applied
+    if (!forceSoftwareDecode && usingHwEnc && !hdrToneMapRequested && !needsScale) {
       if (encName.contains('_nvenc')) {
         preInput.addAll(['-hwaccel', 'cuda']);
       } else if (encName.contains('_qsv')) {
         preInput.addAll(['-hwaccel', 'qsv']);
       } else if (encName.contains('_amf')) {
-        // AMF uses D3D11/DirectX under the hood; decoding accel is typically via d3d11va
         preInput.addAll(['-hwaccel', 'd3d11va']);
       }
     }
 
-    // ------------------ Encoder args ------------------
+    // ---------- Video encoder args ----------
     final vArgs = <String>[];
     if (canCopyVideo) {
       vArgs.addAll(['-c:v', 'copy']);
     } else {
       vArgs.addAll(['-c:v', encName]);
-
       if (encName.contains('_nvenc')) {
-        // Map CRF -> NVENC CQ (rough approximation), preset p1 fastest..p7 best
         final cq = o.useCrf ? o.crf.clamp(10, 40) : 23;
         vArgs.addAll(['-preset', turbo ? 'p1' : 'p4']);
         if (o.useCrf) {
@@ -489,15 +552,20 @@ class FfmpegServiceWin {
           vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
         }
         vArgs.addAll(['-pix_fmt', 'yuv420p']);
+        if (o.container == ContainerFmt.mp4 && effV == VCodec.hevc) {
+          vArgs.addAll(['-tag:v', 'hvc1']);
+        }
       } else if (encName.contains('_qsv')) {
         if (o.useCrf) {
-          // QSV uses -global_quality for ICQ; scale 18~28 → 20~30
           final gq = (o.crf + 2).clamp(18, 42);
           vArgs.addAll(['-rc', 'icq', '-global_quality', '$gq']);
         } else {
           vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
         }
         vArgs.addAll(['-pix_fmt', 'nv12']);
+        if (o.container == ContainerFmt.mp4 && effV == VCodec.hevc) {
+          vArgs.addAll(['-tag:v', 'hvc1']);
+        }
       } else if (encName.contains('_amf')) {
         vArgs.addAll(['-quality', turbo ? 'speed' : 'balanced']);
         if (o.useCrf) {
@@ -506,51 +574,44 @@ class FfmpegServiceWin {
           vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
         }
         vArgs.addAll(['-pix_fmt', 'yuv420p']);
+        if (o.container == ContainerFmt.mp4 && effV == VCodec.hevc) {
+          vArgs.addAll(['-tag:v', 'hvc1']);
+        }
       } else {
         // software encoders
         switch (effV) {
           case VCodec.h264:
             vArgs.addAll(['-preset', turbo ? 'superfast' : 'veryfast', '-profile:v', 'high', '-pix_fmt', 'yuv420p']);
-            if (o.useCrf)
-              vArgs.addAll(['-crf', '${o.crf}']);
-            else
-              vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
+            if (o.useCrf) vArgs.addAll(['-crf', '${o.crf}']); else vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
             break;
           case VCodec.hevc:
-            vArgs.addAll(['-preset', turbo ? 'ultrafast' : 'fast', '-pix_fmt', 'yuv420p', '-tag:v', 'hvc1']);
-            if (o.useCrf)
-              vArgs.addAll(['-crf', '${o.crf}']);
-            else
-              vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
+            vArgs.addAll(['-preset', turbo ? 'ultrafast' : 'fast', '-pix_fmt', 'yuv420p']);
+            if (o.container == ContainerFmt.mp4) vArgs.addAll(['-tag:v', 'hvc1']);
+            if (o.useCrf) vArgs.addAll(['-crf', '${o.crf}']); else vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
             break;
           case VCodec.vp9:
             vArgs.addAll([
-              '-deadline',
-              turbo ? 'realtime' : 'good',
-              '-cpu-used',
-              turbo ? '8' : '2',
-              '-row-mt',
-              '1',
-              '-tile-columns',
-              '2',
-              '-b:v',
-              '${o.vBitrateK}k',
-              '-pix_fmt',
-              'yuv420p',
+              '-deadline', turbo ? 'realtime' : 'good',
+              '-cpu-used', turbo ? '8' : '2',
+              '-row-mt', '1',
+              '-tile-columns', '2',
+              '-b:v', '${o.vBitrateK}k',
+              '-pix_fmt', 'yuv420p',
             ]);
             break;
           case VCodec.av1:
             vArgs.addAll(['-cpu-used', turbo ? '10' : '8', '-pix_fmt', 'yuv420p']);
-            if (o.useCrf)
+            if (o.useCrf) {
               vArgs.addAll(['-crf', '${o.crf}', '-b:v', '0']);
-            else
+            } else {
               vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
+            }
             break;
         }
       }
     }
 
-    // Audio
+    // ---------- Audio ----------
     final aArgs = <String>[];
     if (canCopyAudio) {
       aArgs.addAll(['-c:a', 'copy']);
@@ -562,31 +623,27 @@ class FfmpegServiceWin {
     final movFlags = (o.container == ContainerFmt.mp4) ? ['-movflags', '+faststart'] : <String>[];
 
     final args = <String>[
+      ...preGlobal,
       '-y',
       '-hide_banner',
-      '-stats_period',
-      '0.5',
+      '-stats_period', '0.5',
       ...preInput,
-      '-i',
-      input,
+      '-i', input,
       if (vfChain != null) ...['-vf', vfChain],
       ...fpsArgs,
       ...vArgs,
       ...aArgs,
-      '-threads',
-      '0',
+      '-threads', '0',
       ...movFlags,
-      '-progress',
-      'pipe:1',
+      '-progress', 'pipe:1',
       '-nostats',
       output,
     ];
-    return args.join(' ');
+    return args;
   }
 
   // Parse ffmpeg -progress key=value lines; return out_time_ms
   static int? _parseProgressLine(String line) {
-    // Example: out_time_ms=1234567
     if (line.startsWith('out_time_ms=')) {
       final v = int.tryParse(line.split('=').last.trim());
       return v;
@@ -594,48 +651,44 @@ class FfmpegServiceWin {
     return null;
   }
 
-  Future<ConvertResult> convert({required String cmd, required void Function(double pct) onProgress, required int? durationMs, void Function(Process p)? onProcess}) async {
-    final parts = _shellSplit(cmd);
-    final proc = await Process.start(parts.first, parts.sublist(1), mode: ProcessStartMode.detachedWithStdio);
+  Future<ConvertResult> convert({
+    required List<String> args,
+    required void Function(double pct) onProgress,
+    required int? durationMs,
+    void Function(Process p)? onProcess,
+  }) async {
+    final proc = await Process.start(bins.ffmpeg, args, mode: ProcessStartMode.normal);
     onProcess?.call(proc);
 
     final tail = <String>[];
-    final completer = Completer<ConvertResult>();
 
     // progress from stdout (-progress pipe:1)
-    proc.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
+    proc.stdout
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen((line) {
       if (line.isEmpty) return;
       tail.add(line);
       if (tail.length > 200) tail.removeAt(0);
       final ms = _parseProgressLine(line);
       if (ms != null && durationMs != null && durationMs > 0) {
-        final pct = (ms / durationMs).clamp(0.0, 1.0);
-        onProgress(pct);
+        onProgress((ms / durationMs).clamp(0.0, 1.0));
       }
     });
 
     // collect stderr tail for diagnostics
-    proc.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
+    proc.stderr
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen((line) {
       if (line.isEmpty) return;
       tail.add(line);
       if (tail.length > 200) tail.removeAt(0);
     });
 
-    proc.exitCode.then((code) {
-      final ok = code == 0;
-      final cancelled = false; // (if you wire SIGINT you can set it)
-      final last = tail.skip(tail.length > 120 ? tail.length - 120 : 0).join('\n');
-      completer.complete(ConvertResult(ok: ok, cancelled: cancelled, returnCode: code, tailLog: last));
-    });
-
-    return completer.future;
-  }
-
-  // Tiny shell splitter for our simple command strings
-  static List<String> _shellSplit(String cmd) {
-    final rx = RegExp(r'("([^"]*)"|\S+)');
-    final m = rx.allMatches(cmd);
-    return m.map((e) => (e.group(2) ?? e.group(1)!)).toList();
+    final code = await proc.exitCode;
+    final last = tail.skip(tail.length > 120 ? tail.length - 120 : 0).join('\n');
+    return ConvertResult(ok: code == 0, cancelled: false, returnCode: code, tailLog: last);
   }
 }
 
@@ -687,22 +740,56 @@ class _ConverterHomeState extends State<ConverterHome> {
     _initDefaults();
   }
 
+  /// Try common side-by-side locations for Option A:
+  /// - CWD\ffmpeg\bin (flutter run from project root)
+  /// - <exeDir>\ffmpeg\bin (packaged)
+  /// - a couple of parent hops
+  String? findBundledFfmpegBin() {
+    String? _hit(String dir) {
+      final ff = File(p.join(dir, 'ffmpeg.exe'));
+      final fp = File(p.join(dir, 'ffprobe.exe'));
+      return (ff.existsSync() && fp.existsSync()) ? p.normalize(dir) : null;
+    }
+
+    final cwd = Directory.current.path;
+    final exeDir = p.dirname(Platform.resolvedExecutable);
+
+    final candidates = <String>[
+      p.join(cwd, 'ffmpeg', 'bin'),
+      p.join(exeDir, 'ffmpeg', 'bin'),
+      p.join(exeDir, '..', 'ffmpeg', 'bin'),
+      p.join(exeDir, '..', '..', 'ffmpeg', 'bin'),
+    ];
+
+    for (final c in candidates) {
+      final hit = _hit(c);
+      if (hit != null) return hit;
+    }
+    return null;
+  }
+
   Future<void> _initDefaults() async {
     opts.outputDir = await _suggestDefaultFolder();
-    _bins = FfmpegBins(null);
+
+    // Option A only: prefer side-by-side; else default to PATH.
+    final local = findBundledFfmpegBin();
+    if (local != null) {
+      opts.ffmpegDir = local;
+    }
+
+    _bins = FfmpegBins(opts.ffmpegDir);
     final ok = await _bins.check();
-    setState(() {
-      _status = ok ? 'Ready' : 'FFmpeg not found. Add to PATH or set folder below.';
-    });
+    setState(() => _status = ok ? 'Ready' : 'FFmpeg not found. Add to PATH or set folder below.');
+
     _caps = await GpuCaps.probe(_bins);
     setState(() {});
   }
 
   Future<String> _suggestDefaultFolder() async {
     try {
-      final vids = await getDownloadsDirectory();
-      if (vids != null) {
-        final dir = Directory(p.join(vids.path, 'FormatFlex'));
+      final dl = await getDownloadsDirectory();
+      if (dl != null) {
+        final dir = Directory(p.join(dl.path, 'FormatFlex'));
         if (!await dir.exists()) await dir.create(recursive: true);
         return dir.path;
       }
@@ -791,19 +878,17 @@ class _ConverterHomeState extends State<ConverterHome> {
     await Directory(p.dirname(tempOut)).create(recursive: true);
 
     // Attempt #1: as configured (may use HW)
-    final cmd1 = svc.buildCommand(input: opts.input, output: tempOut, probe: probe, o: opts);
+    final args1 = svc.buildCommand(input: opts.input, output: tempOut, probe: probe, o: opts);
     setState(() => _status = 'Converting… (HW accel when available)');
 
     ConvertResult res = await svc.convert(
-      cmd: cmd1,
-      onProgress: (pct) {
-        setState(() => _progress = pct);
-      },
+      args: args1,
+      onProgress: (p) => setState(() => _progress = p),
       durationMs: _durationMs,
       onProcess: (p) => _active = p,
     );
 
-    bool mustRetrySoft = !res.ok && !res.cancelled && (res.returnCode != 0);
+    final mustRetrySoft = !res.ok && !res.cancelled && (res.returnCode != 0);
 
     // Attempt #2: force SW path
     if (mustRetrySoft) {
@@ -830,8 +915,21 @@ class _ConverterHomeState extends State<ConverterHome> {
         ..turbo = false
         ..ffmpegDir = opts.ffmpegDir;
 
-      final cmd2 = svc.buildCommand(input: opts.input, output: tempOut, probe: probe, o: soft, forceSoftwareDecode: true, forceSoftwareEncode: true);
-      res = await svc.convert(cmd: cmd2, onProgress: (pct) => setState(() => _progress = pct), durationMs: _durationMs, onProcess: (p) => _active = p);
+      final args2 = svc.buildCommand(
+        input: opts.input,
+        output: tempOut,
+        probe: probe,
+        o: soft,
+        forceSoftwareDecode: true,
+        forceSoftwareEncode: true,
+      );
+
+      res = await svc.convert(
+        args: args2,
+        onProgress: (p) => setState(() => _progress = p),
+        durationMs: _durationMs,
+        onProcess: (p) => _active = p,
+      );
     }
 
     // finalize
@@ -896,9 +994,10 @@ class _ConverterHomeState extends State<ConverterHome> {
 
   Future<void> _cancel() async {
     try {
-      _active?.kill(ProcessSignal.sigint);
-      _active?.kill(ProcessSignal.sigterm);
-      _active?.kill();
+      _active?.stdin.add(utf8.encode('q')); // graceful
+      await Future.delayed(const Duration(milliseconds: 200));
+      _active?.kill(ProcessSignal.sigint);  // best-effort on Windows
+      _active?.kill();                      // hard kill
     } catch (_) {}
     setState(() => _busy = false);
   }
@@ -921,7 +1020,7 @@ class _ConverterHomeState extends State<ConverterHome> {
         controller: _scroll,
         padding: const EdgeInsets.all(16),
         children: [
-          Text('Status: $_status'),
+          Text('Status: $_status${opts.ffmpegDir != null ? "  (FFmpeg: ${opts.ffmpegDir})" : ""}'),
           const SizedBox(height: 8),
           Row(
             children: [
@@ -939,37 +1038,48 @@ class _ConverterHomeState extends State<ConverterHome> {
             onChanged: _busy
                 ? null
                 : (v) => setState(() {
-                    opts.turbo = v;
-                    if (v) {
-                      opts
-                        ..container = ContainerFmt.mp4
-                        ..vcodec = VCodec.h264
-                        ..acodec = ACodec.aac
-                        ..useHwEncoder = true
-                        ..toneMapHdrToSdr = false
-                        ..fps = null
-                        ..useCrf = true
-                        ..twoPass = false;
-                    }
-                    if (opts.input.isNotEmpty) _suggestOutputName(opts.input);
-                  }),
+              opts.turbo = v;
+              if (v) {
+                opts
+                  ..container = ContainerFmt.mp4
+                  ..vcodec = VCodec.h264
+                  ..acodec = ACodec.aac
+                  ..useHwEncoder = true
+                  ..toneMapHdrToSdr = false
+                  ..fps = null
+                  ..useCrf = true
+                  ..twoPass = false;
+              }
+              if (opts.input.isNotEmpty) _suggestOutputName(opts.input);
+            }),
           ),
           const SizedBox(height: 8),
 
           // FFmpeg folder (optional)
           TextField(
             onChanged: _busy ? null : (v) => opts.ffmpegDir = v.trim().isEmpty ? null : v.trim(),
-            decoration: const InputDecoration(labelText: 'FFmpeg Folder (optional)', hintText: r'C:\ffmpeg\bin', border: OutlineInputBorder()),
+            decoration: const InputDecoration(
+              labelText: 'FFmpeg Folder (optional)',
+              hintText: r'C:\path\to\ffmpeg\bin',
+              border: OutlineInputBorder(),
+            ),
           ),
           const SizedBox(height: 12),
 
           Row(
             children: [
               Expanded(
-                child: FilledButton.icon(onPressed: _busy ? null : _pickInput, icon: const Icon(Icons.video_file), label: const Text('Pick Video')),
+                child: FilledButton.icon(
+                  onPressed: _busy ? null : _pickInput,
+                  icon: const Icon(Icons.video_file),
+                  label: const Text('Pick Video'),
+                ),
               ),
               const SizedBox(width: 8),
-              FilledButton.tonal(onPressed: _busy ? null : _chooseOutputFolder, child: const Text('Choose Output Folder…')),
+              FilledButton.tonal(
+                onPressed: _busy ? null : _chooseOutputFolder,
+                child: const Text('Choose Output Folder…'),
+              ),
             ],
           ),
           const SizedBox(height: 16),
@@ -986,9 +1096,9 @@ class _ConverterHomeState extends State<ConverterHome> {
             onChanged: _busy
                 ? null
                 : (v) => setState(() {
-                    opts.outputFileName = v;
-                    opts.output = opts.computedOutputPath();
-                  }),
+              opts.outputFileName = v;
+              opts.output = opts.computedOutputPath();
+            }),
             controller: TextEditingController(text: opts.outputFileName),
             readOnly: _busy,
             decoration: const InputDecoration(labelText: 'Output File Name', hintText: 'movie_1080p.mp4', border: OutlineInputBorder()),
@@ -1011,12 +1121,12 @@ class _ConverterHomeState extends State<ConverterHome> {
               onChanged: _busy
                   ? null
                   : (pz) {
-                      if (pz == null) return;
-                      setState(() {
-                        opts.applyPreset(pz);
-                        _suggestOutputName(opts.input.isNotEmpty ? opts.input : opts.outputFileName);
-                      });
-                    },
+                if (pz == null) return;
+                setState(() {
+                  opts.applyPreset(pz);
+                  _suggestOutputName(opts.input.isNotEmpty ? opts.input : opts.outputFileName);
+                });
+              },
             ),
           ),
           const SizedBox(height: 12),
@@ -1029,12 +1139,12 @@ class _ConverterHomeState extends State<ConverterHome> {
               onChanged: _busy
                   ? null
                   : (v) {
-                      if (v == null) return;
-                      setState(() {
-                        opts.container = v;
-                        if (opts.input.isNotEmpty) _suggestOutputName(opts.input);
-                      });
-                    },
+                if (v == null) return;
+                setState(() {
+                  opts.container = v;
+                  if (opts.input.isNotEmpty) _suggestOutputName(opts.input);
+                });
+              },
             ),
           ),
           const SizedBox(height: 12),
@@ -1067,12 +1177,12 @@ class _ConverterHomeState extends State<ConverterHome> {
               onChanged: _busy
                   ? null
                   : (r) {
-                      if (r == null) return;
-                      setState(() {
-                        opts.resolution = r;
-                        if (opts.input.isNotEmpty) _suggestOutputName(opts.input);
-                      });
-                    },
+                if (r == null) return;
+                setState(() {
+                  opts.resolution = r;
+                  if (opts.input.isNotEmpty) _suggestOutputName(opts.input);
+                });
+              },
             ),
           ),
           const SizedBox(height: 12),
@@ -1081,7 +1191,9 @@ class _ConverterHomeState extends State<ConverterHome> {
             label: 'Frame Rate',
             child: DropdownButtonFormField<double?>(
               value: opts.fps,
-              items: [null, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0].map((f) => DropdownMenuItem(value: f, child: Text(f == null ? 'Keep original' : f.toString()))).toList(),
+              items: [null, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0]
+                  .map((f) => DropdownMenuItem(value: f, child: Text(f == null ? 'Keep original' : f.toString())))
+                  .toList(),
               onChanged: _busy ? null : (f) => setState(() => opts.fps = f),
             ),
           ),
@@ -1094,7 +1206,13 @@ class _ConverterHomeState extends State<ConverterHome> {
             onChanged: _busy ? null : (v) => setState(() => opts.useCrf = v),
           ),
           if (opts.useCrf)
-            _NumberField(label: 'CRF (lower = better, typical 18–28)', value: opts.crf.toDouble(), min: 0, max: 51, onChanged: (v) => setState(() => opts.crf = v.round()))
+            _NumberField(
+              label: 'CRF (lower = better, typical 18–28)',
+              value: opts.crf.toDouble(),
+              min: 0,
+              max: 51,
+              onChanged: (v) => setState(() => opts.crf = v.round()),
+            )
           else
             _NumberField(
               label: 'Video Bitrate (kbps)',
@@ -1106,7 +1224,14 @@ class _ConverterHomeState extends State<ConverterHome> {
             ),
 
           const SizedBox(height: 12),
-          _NumberField(label: 'Audio Bitrate (kbps)', value: opts.aBitrateK.toDouble(), min: 96, max: 768, step: 32, onChanged: (v) => setState(() => opts.aBitrateK = v.round())),
+          _NumberField(
+            label: 'Audio Bitrate (kbps)',
+            value: opts.aBitrateK.toDouble(),
+            min: 96,
+            max: 768,
+            step: 32,
+            onChanged: (v) => setState(() => opts.aBitrateK = v.round()),
+          ),
           const SizedBox(height: 12),
 
           _Labeled(
@@ -1133,15 +1258,19 @@ class _ConverterHomeState extends State<ConverterHome> {
             value: opts.toneMapHdrToSdr,
             onChanged: _busy ? null : (v) => setState(() => opts.toneMapHdrToSdr = v ?? true),
             title: const Text('Tone-map HDR → SDR when needed'),
-            subtitle: const Text('CPU tonemap by default; fastest when HDR not present'),
+            subtitle: const Text('OpenCL when available; CPU fallback otherwise'),
           ),
           const SizedBox(height: 12),
 
           SwitchListTile(
             title: const Text('Use hardware encoder (faster)'),
             subtitle: Text(
-              'Detected: '
-              '${_caps == null ? '…' : [if (_caps!.hasNVENC) 'NVENC', if (_caps!.hasQSV) 'QSV', if (_caps!.hasAMF) 'AMF'].join(', ').ifEmpty('none')}',
+              'Detected: ${_caps == null ? "…" : [
+                if (_caps!.hasNVENC) "NVENC",
+                if (_caps!.hasQSV) "QSV",
+                if (_caps!.hasAMF) "AMF",
+              ].join(", ").ifEmpty("none")} — '
+                  '${_caps?.hasTonemapOpenCL == true ? "OpenCL tonemap ✓" : "OpenCL tonemap ✗"}',
             ),
             value: opts.useHwEncoder,
             onChanged: _busy ? null : (v) => setState(() => opts.useHwEncoder = v),
@@ -1151,7 +1280,11 @@ class _ConverterHomeState extends State<ConverterHome> {
           Row(
             children: [
               Expanded(
-                child: FilledButton.icon(onPressed: (!canConvert || _busy) ? null : _convert, icon: const Icon(Icons.play_arrow), label: const Text('Convert')),
+                child: FilledButton.icon(
+                  onPressed: (!canConvert || _busy) ? null : _convert,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Convert'),
+                ),
               ),
             ],
           ),
@@ -1165,10 +1298,6 @@ class _ConverterHomeState extends State<ConverterHome> {
 
 extension _EmptyX on String {
   String ifEmpty(String alt) => isEmpty ? alt : this;
-}
-
-extension _ListJoinX on List<String> {
-  String ifEmpty(String alt) => isEmpty ? alt : join(', ');
 }
 
 class _Labeled extends StatelessWidget {
@@ -1193,7 +1322,14 @@ class _NumberField extends StatefulWidget {
   final double max;
   final double step;
   final ValueChanged<double> onChanged;
-  const _NumberField({required this.label, required this.value, required this.onChanged, this.min = 0, this.max = 100, this.step = 1});
+  const _NumberField({
+    required this.label,
+    required this.value,
+    required this.onChanged,
+    this.min = 0,
+    this.max = 100,
+    this.step = 1,
+  });
   @override
   State<_NumberField> createState() => _NumberFieldState();
 }
@@ -1245,10 +1381,10 @@ class _TipsBox extends StatelessWidget {
           children: const [
             Text('Compatibility & Speed tips', style: TextStyle(fontWeight: FontWeight.bold)),
             SizedBox(height: 8),
-            Text('• Turbo: H.264 + MP4, HW encode, stream copy when possible, HDR tone-map off, keep FPS.'),
+            Text('• Turbo: H.264 + MP4, HW encode, stream copy when possible, keep FPS, HDR tone-map off.'),
             Text('• Prefer MP4 + H.264 + AAC/AC-3 for older TVs.'),
             Text('• 1080p or 720p often plays best on lower-end devices.'),
-            Text('• HDR→SDR tone-mapping is CPU heavy—only enable if needed.'),
+            Text('• OpenCL HDR→SDR when available; CPU tonemap is heavier.'),
             Text('• AV1 is efficient but slow on CPU; use NVENC/AMF/QSV AV1 if supported.'),
           ],
         ),
