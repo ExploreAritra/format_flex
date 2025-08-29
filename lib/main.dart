@@ -42,12 +42,6 @@ Future<void> main() async {
       channelImportance: NotificationChannelImportance.HIGH,
       priority: NotificationPriority.HIGH,
       onlyAlertOnce: true,
-      // (Optional) explicit small icon can reduce OEM quirks:
-      // iconData: const NotificationIconData(
-      //   resType: ResourceType.mipmap,
-      //   resPrefix: ResourcePrefix.ic,
-      //   name: 'launcher',
-      // ),
     ),
     iosNotificationOptions: const IOSNotificationOptions(),
     foregroundTaskOptions: ForegroundTaskOptions(
@@ -68,24 +62,16 @@ Future<void> main() async {
 
 class _ConvTaskHandler extends TaskHandler {
   @override
-  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {
-    // one-time init (if any)
-  }
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
 
   @override
-  void onRepeatEvent(DateTime timestamp) {
-    // keep this lightweight — e.g., no heavy I/O here
-  }
+  void onRepeatEvent(DateTime timestamp) {}
 
   @override
-  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {
-    // cleanup (if any)
-  }
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
 
   @override
-  void onReceiveData(Object data) {
-    // handle messages from app -> task (optional)
-  }
+  void onReceiveData(Object data) {}
 
   @override
   void onNotificationButtonPressed(String id) {
@@ -100,9 +86,7 @@ class _ConvTaskHandler extends TaskHandler {
   }
 
   @override
-  void onNotificationDismissed() {
-    // Android 14+/iOS 12+
-  }
+  void onNotificationDismissed() {}
 }
 
 // =============================================================
@@ -318,6 +302,14 @@ class ConvertOptions {
   String? outputDir;
   String outputFileName = '';
 
+  // Track selection and mixing
+  int videoStream = 0; // usually 0
+  int? audioStream; // null = auto
+  bool allowDownmix = true;
+
+  // Speed+compat toggle mirroring desktop build
+  bool turbo = false;
+
   Preset preset = kPresets.first;
 
   ContainerFmt container = ContainerFmt.mp4;
@@ -335,7 +327,6 @@ class ConvertOptions {
   bool toneMapHdrToSdr = true;
 
   bool useHwEncoder = false;
-  bool turbo = false;
 
   void applyPreset(Preset p) {
     preset = p;
@@ -386,6 +377,19 @@ class ConvertResult {
   ConvertResult({required this.ok, required this.cancelled, required this.returnCode, required this.tailLog});
 }
 
+class LogBuffer {
+  static final LogBuffer I = LogBuffer();
+  final List<String> _lines = [];
+  void add(String? s) {
+    final line = s ?? '';
+    _lines.add(line);
+    if (_lines.length > 800) _lines.removeAt(0);
+  }
+
+  void clear() => _lines.clear();
+  String dump() => _lines.join('\n');
+}
+
 class FfmpegService {
   Future<MediaProbeResult> probe(String inputPath) async {
     final probe = await FFprobeKit.getMediaInformation(inputPath);
@@ -396,9 +400,9 @@ class FfmpegService {
     final d = double.tryParse(info.getDuration() ?? '');
     if (d != null) durationMs = (d * 1000).round();
 
-    final streams = info.getStreams() ?? <StreamInformation>[];
+    final streams = info.getStreams();
 
-    String? _str(StreamInformation s, String key) {
+    String? str(StreamInformation s, String key) {
       try {
         final v = s.getStringProperty(key);
         if (v != null) return v;
@@ -411,7 +415,7 @@ class FfmpegService {
     }
 
     int? _int(StreamInformation s, String key) {
-      final sv = _str(s, key);
+      final sv = str(s, key);
       if (sv != null && sv.isNotEmpty) {
         final i = int.tryParse(sv);
         if (i != null) return i;
@@ -436,9 +440,9 @@ class FfmpegService {
         w ??= _int(s, 'width');
         h ??= _int(s, 'height');
         vCodec ??= s.getCodec();
-        pix ??= _str(s, 'pix_fmt');
-        final ct = (_str(s, 'color_transfer') ?? _str(s, 'color_transfer_name') ?? '').toLowerCase();
-        final cp = (_str(s, 'color_primaries') ?? _str(s, 'color_primaries_name') ?? '').toLowerCase();
+        pix ??= str(s, 'pix_fmt');
+        final ct = (str(s, 'color_transfer') ?? str(s, 'color_transfer_name') ?? '').toLowerCase();
+        final cp = (str(s, 'color_primaries') ?? str(s, 'color_primaries_name') ?? '').toLowerCase();
         if (ct.contains('smpte2084') || ct.contains('pq') || ct.contains('hlg') || cp.contains('bt2020')) hasHdr = true;
       } else if (type == 'audio') {
         aCodec ??= s.getCodec();
@@ -496,14 +500,14 @@ class FfmpegService {
     final preInput = <String>[];
     if (Platform.isAndroid && !forceSoftwareDecode) {
       String? inDec;
-      final vname = (probe.vCodecName ?? '').toLowerCase();
-      if (vname.contains('hevc')) {
+      final vName = (probe.vCodecName ?? '').toLowerCase();
+      if (vName.contains('hevc')) {
         inDec = 'hevc_mediacodec';
-      } else if (vname.contains('h264') || vname.contains('avc')) {
+      } else if (vName.contains('h264') || vName.contains('avc')) {
         inDec = 'h264_mediacodec';
-      } else if (vname.contains('vp9')) {
+      } else if (vName.contains('vp9')) {
         inDec = 'vp9_mediacodec';
-      } else if (vname.contains('av1')) {
+      } else if (vName.contains('av1')) {
         inDec = 'av1_mediacodec';
       }
       if (inDec != null) {
@@ -590,10 +594,23 @@ class FfmpegService {
     }
 
     final aArgs = <String>[];
+    int targetChannels = o.audioChannels;
+    if (!o.allowDownmix && (probe.aChannels != null) && (targetChannels < probe.aChannels!)) {
+      targetChannels = probe.aChannels!; // keep original, no downmix
+    }
     if (canCopyAudio) {
       aArgs.addAll(['-c:a', 'copy']);
     } else {
-      aArgs.addAll(['-c:a', o.acodec.ffmpegName, '-b:a', '${o.aBitrateK}k', '-ac', '${o.audioChannels}', '-ar', '${o.sampleRate}']);
+      aArgs.addAll(['-c:a', o.acodec.ffmpegName, '-b:a', '${o.aBitrateK}k', '-ac', '$targetChannels', '-ar', '${o.sampleRate}']);
+    }
+
+    // Explicit stream mapping (if user set)
+    final mapArgs = <String>[];
+    if (o.videoStream >= 0) {
+      mapArgs.addAll(['-map', '0:v:${o.videoStream}']);
+    }
+    if (o.audioStream != null) {
+      mapArgs.addAll(['-map', '0:a:${o.audioStream}']);
     }
 
     final fpsArgs = (turbo ? <String>[] : (o.fps != null ? ['-r', o.fps!.toString()] : <String>[]));
@@ -608,6 +625,7 @@ class FfmpegService {
       ...preInput,
       '-i',
       '"$input"',
+      ...mapArgs,
       if (vfChain != null) ...['-vf', '"$vfChain"'],
       ...fpsArgs,
       ...vArgs,
@@ -618,14 +636,22 @@ class FfmpegService {
     return args.join(' ');
   }
 
-  Future<ConvertResult> convert({required String cmd, required void Function(double pct) onProgress, void Function(int id)? onSession}) async {
+  // onProgress now forwards rawSec + speedX + frame
+  Future<ConvertResult> convert({required String cmd, required void Function(double rawSec, {double? speedX, int? frame}) onProgress, void Function(int id)? onSession}) async {
     final List<String> tail = [];
     FFmpegKitConfig.enableLogCallback((log) {
-      final line = log.getMessage() ?? '';
+      final line = log.getMessage();
       tail.add(line);
       if (tail.length > 400) tail.removeAt(0);
     });
-    FFmpegKitConfig.enableStatisticsCallback((Statistics s) => onProgress(_pct(s)));
+
+    FFmpegKitConfig.enableStatisticsCallback((Statistics s) {
+      final rawMs = s.getTime();
+      final rawSec = rawMs <= 0 ? 0.0 : rawMs / 1000.0;
+      final double speedX = s.getSpeed();
+      final int frame = s.getVideoFrameNumber();
+      onProgress(rawSec, speedX: speedX, frame: frame);
+    });
 
     final completer = Completer<ConvertResult>();
 
@@ -639,12 +665,6 @@ class FfmpegService {
 
     onSession?.call(session.getSessionId() ?? 0);
     return completer.future;
-  }
-
-  double _pct(Statistics s) {
-    final t = s.getTime();
-    if (t <= 0) return 0.0;
-    return t / 1000.0;
   }
 }
 
@@ -703,6 +723,11 @@ class _ConverterHomeState extends State<ConverterHome> {
 
   @override
   void initState() {
+    FFmpegKitConfig.enableLogCallback((log) {
+      try {
+        LogBuffer.I.add(log.getMessage());
+      } catch (_) {}
+    });
     super.initState();
     _initDefaultFolder();
     _initMediaStore();
@@ -738,7 +763,6 @@ class _ConverterHomeState extends State<ConverterHome> {
 
     if (!Platform.isAndroid) return FlutterForegroundTask.stopService();
 
-    // Always give Android 14+ a runtime FGS type.
     if (await FlutterForegroundTask.isRunningService) {
       return FlutterForegroundTask.restartService();
     }
@@ -829,7 +853,6 @@ class _ConverterHomeState extends State<ConverterHome> {
     }
   }
 
-  /// Returns (dirName, relativePath) if the absolute path is in a known public media bucket.
   (DirName, String)? _mediaBucketFor(String targetDir) {
     final norm = targetDir.replaceAll('\\', '/');
     final parts = norm.split('/');
@@ -856,26 +879,21 @@ class _ConverterHomeState extends State<ConverterHome> {
     return null;
   }
 
-  /// Move/copy the temp file to the chosen **final** destination (honors Output Folder).
-  /// Returns final path/uri or null on failure.
   Future<String?> _exportFinal({required String tempFilePath}) async {
     final desiredDir = (opts.outputDir ?? '').trim();
     final finalName = opts.outputFileName;
 
-    // If no chosen dir, drop into /Movies/FormatFlex via MediaStore
     if (desiredDir.isEmpty) {
       return _saveViaMediaStore(tempFilePath, DirName.movies, 'FormatFlex');
     }
 
     if (Platform.isAndroid) {
-      // If chosen folder is a public media bucket, save via MediaStore to that exact subpath
       final bucket = _mediaBucketFor(desiredDir);
       if (bucket != null) {
         final (dirName, rel) = bucket;
         return _saveViaMediaStore(tempFilePath, dirName, rel);
       }
 
-      // Otherwise, try direct filesystem write (e.g., app's external files dir)
       if (await _testWritableDir(desiredDir)) {
         try {
           final outPath = p.join(desiredDir, finalName);
@@ -889,14 +907,12 @@ class _ConverterHomeState extends State<ConverterHome> {
         } catch (_) {}
       }
 
-      // Fallback (tell user)
       final fallback = await _saveViaMediaStore(tempFilePath, DirName.movies, 'FormatFlex');
       if (fallback != null) {
         setState(() => _status = 'Chosen folder not writable. Saved to /Movies/FormatFlex instead.');
       }
       return fallback;
     } else {
-      // iOS/macOS/windows/linux: write directly
       try {
         if (!await Directory(desiredDir).exists()) {
           await Directory(desiredDir).create(recursive: true);
@@ -973,6 +989,24 @@ class _ConverterHomeState extends State<ConverterHome> {
 
   bool get _isLockedByTurbo => opts.turbo;
 
+  // ============== Pretty status like Windows build ==============
+
+  String _prettyProgress(int? outUs, int? totalMs, double? speedX) {
+    String fmtMs(int ms) {
+      final s = (ms ~/ 1000);
+      final h = s ~/ 3600, m = (s % 3600) ~/ 60, sec = s % 60;
+      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}';
+    }
+
+    if (outUs == null || totalMs == null || totalMs <= 0) return 'Converting…';
+    final outMs = (outUs / 1000).round();
+    final pct = outMs / totalMs;
+    final leftMs = (speedX != null && speedX > 0) ? ((totalMs - outMs) / speedX).round() : (totalMs - outMs);
+    return 'Converting… ${fmtMs(outMs)} / ${fmtMs(totalMs)}  (${(pct * 100).toStringAsFixed(2)}%)'
+        '${speedX != null ? ' • ${speedX.toStringAsFixed(2)}x' : ''}'
+        ' • ETA ${fmtMs(leftMs)}';
+  }
+
   // ====================== Convert flow ======================
 
   Future<void> _convert() async {
@@ -1005,91 +1039,133 @@ class _ConverterHomeState extends State<ConverterHome> {
     if (!await tmpWorkDir.exists()) await tmpWorkDir.create(recursive: true);
     final tempOutPath = p.join(tmpWorkDir.path, opts.outputFileName);
 
-    // ---------- Attempt #1: as configured (may use HW accel) ----------
+    // Two-pass is software-only: if enabled, temporarily disable HW.
+    final bool doTwoPass = opts.twoPass;
+    final bool origHw = opts.useHwEncoder;
+    if (doTwoPass) opts.useHwEncoder = false;
+
+    // Build initial command (may use HW if two-pass is off)
     String cmd = _svc.buildCommand(input: opts.input, output: tempOutPath, probe: probe, o: opts);
 
     setState(() => _status = 'Converting… (HW accel when available)');
     FlutterForegroundTask.updateService(notificationTitle: 'Converting video…', notificationText: 'Starting…');
 
-    ConvertResult res = await _svc.convert(
-      cmd: cmd,
-      onProgress: (rawSec) {
-        if (_durationMs == null || _durationMs == 0) return;
-        final pct = (rawSec * 1000) / _durationMs!;
-        setState(() => _progress = pct.clamp(0.0, 1.0));
-        FlutterForegroundTask.updateService(notificationTitle: 'Converting video…', notificationText: 'Progress ${(_progress * 100).toStringAsFixed(1)}%');
-      },
-      onSession: (id) => _sessionId = id,
-    );
+    ConvertResult res;
 
-    // Heuristics for HW decode/encode failure that warrants SW fallback
-    bool mustRetrySoft =
-        !res.ok &&
-        !res.cancelled &&
-        (res.returnCode == null ||
-            res.tailLog.toLowerCase().contains('mediacodec') ||
-            res.tailLog.toLowerCase().contains('decoder failed to start') ||
-            res.tailLog.toLowerCase().contains('unable to configure codec') ||
-            res.tailLog.toLowerCase().contains('both surface and native_window are null'));
+    if (doTwoPass) {
+      // ---- TWO-PASS BRANCH ----
+      setState(() => _status = 'Pass 1/2…');
 
-    // ---------- Attempt #2: force software decode/encode ----------
-    if (mustRetrySoft) {
-      setState(() {
-        _status = 'Hardware encoding failed — retrying with software encoding…';
-        _progress = 0;
-      });
-      FlutterForegroundTask.updateService(notificationTitle: 'Converting (SW fallback)…', notificationText: 'Retrying without hardware acceleration');
+      final nullSink = (Platform.isWindows) ? 'NUL' : '/dev/null';
 
-      final softOpts = ConvertOptions()
-        ..applyPreset(opts.preset)
-        ..container = opts.container
-        ..vcodec = opts.vcodec
-        ..acodec = opts.acodec
-        ..resolution = opts.resolution
-        ..twoPass = opts.twoPass
-        ..useCrf = opts.useCrf
-        ..crf = opts.crf
-        ..vBitrateK = opts.vBitrateK
-        ..aBitrateK = opts.aBitrateK
-        ..audioChannels = opts.audioChannels
-        ..sampleRate = opts.sampleRate
-        ..fps = opts.fps
-        ..toneMapHdrToSdr = opts.toneMapHdrToSdr
-        ..useHwEncoder = false
-        ..turbo = false;
+      final pass1 = '$cmd -pass 1 -passlogfile "$tempOutPath.log" -f null $nullSink';
+      await _svc.convert(
+        cmd: pass1,
+        onProgress: (_, {speedX, frame}) {}, // no bar for null sink
+        onSession: (id) => _sessionId = id,
+      );
 
-      cmd = _svc.buildCommand(input: opts.input, output: tempOutPath, probe: probe, o: softOpts, forceSoftwareDecode: true, forceSoftwareEncode: true);
-
+      setState(() => _status = 'Pass 2/2…');
+      final pass2 = '$cmd -pass 2 -passlogfile "$tempOutPath.log"';
       res = await _svc.convert(
-        cmd: cmd,
-        onProgress: (rawSec) {
+        cmd: pass2,
+        onProgress: (rawSec, {speedX, frame}) {
           if (_durationMs == null || _durationMs == 0) return;
+          final outUs = (rawSec * 1000000).round();
           final pct = (rawSec * 1000) / _durationMs!;
-          setState(() => _progress = pct.clamp(0.0, 1.0));
-          FlutterForegroundTask.updateService(notificationTitle: 'Converting (SW)…', notificationText: 'Progress ${(_progress * 100).toStringAsFixed(1)}%');
+          setState(() {
+            _progress = pct.clamp(0.0, 1.0);
+            _status = _prettyProgress(outUs, _durationMs, speedX);
+          });
+          FlutterForegroundTask.updateService(notificationTitle: 'Converting video…', notificationText: 'Progress ${(_progress * 100).toStringAsFixed(1)}%');
         },
         onSession: (id) => _sessionId = id,
       );
+    } else {
+      // ---- SINGLE-PASS BRANCH ----
+      res = await _svc.convert(
+        cmd: cmd,
+        onProgress: (rawSec, {speedX, frame}) {
+          if (_durationMs == null || _durationMs == 0) return;
+          final outUs = (rawSec * 1000000).round();
+          final pct = (rawSec * 1000) / _durationMs!;
+          setState(() {
+            _progress = pct.clamp(0.0, 1.0);
+            _status = _prettyProgress(outUs, _durationMs, speedX);
+          });
+          FlutterForegroundTask.updateService(notificationTitle: 'Converting video…', notificationText: 'Progress ${(_progress * 100).toStringAsFixed(1)}%');
+        },
+        onSession: (id) => _sessionId = id,
+      );
+
+      // Heuristics for HW decode/encode failure that warrants SW fallback
+      final tl = res.tailLog.toLowerCase();
+      final mustRetrySoft =
+          !res.ok &&
+          !res.cancelled &&
+          (res.returnCode == null ||
+              tl.contains('mediacodec') ||
+              tl.contains('decoder failed to start') ||
+              tl.contains('unable to configure codec') ||
+              tl.contains('both surface and native_window are null'));
+
+      if (mustRetrySoft) {
+        setState(() {
+          _status = 'Hardware encoding failed — retrying with software encoding…';
+          _progress = 0;
+        });
+        FlutterForegroundTask.updateService(notificationTitle: 'Converting (SW fallback)…', notificationText: 'Retrying without hardware acceleration');
+
+        final softOpts = ConvertOptions()
+          ..applyPreset(opts.preset)
+          ..container = opts.container
+          ..vcodec = opts.vcodec
+          ..acodec = opts.acodec
+          ..resolution = opts.resolution
+          ..twoPass = false
+          ..useCrf = opts.useCrf
+          ..crf = opts.crf
+          ..vBitrateK = opts.vBitrateK
+          ..aBitrateK = opts.aBitrateK
+          ..audioChannels = opts.audioChannels
+          ..sampleRate = opts.sampleRate
+          ..fps = opts.fps
+          ..toneMapHdrToSdr = opts.toneMapHdrToSdr
+          ..useHwEncoder = false
+          ..turbo = false;
+
+        cmd = _svc.buildCommand(input: opts.input, output: tempOutPath, probe: probe, o: softOpts, forceSoftwareDecode: true, forceSoftwareEncode: true);
+
+        res = await _svc.convert(
+          cmd: cmd,
+          onProgress: (rawSec, {speedX, frame}) {
+            if (_durationMs == null || _durationMs == 0) return;
+            final outUs = (rawSec * 1000000).round();
+            final pct = (rawSec * 1000) / _durationMs!;
+            setState(() {
+              _progress = pct.clamp(0.0, 1.0);
+              _status = _prettyProgress(outUs, _durationMs, speedX);
+            });
+            FlutterForegroundTask.updateService(notificationTitle: 'Converting (SW)…', notificationText: 'Progress ${(_progress * 100).toStringAsFixed(1)}%');
+          },
+          onSession: (id) => _sessionId = id,
+        );
+      }
     }
 
-    // ---------- Finalize ----------
+    // ---- Finalize (common) ----
     if (res.ok) {
       final finalPath = await _exportFinal(tempFilePath: tempOutPath);
-
       setState(() {
-        if (finalPath != null) {
-          _status = 'Saved: $finalPath';
-        } else {
-          _status = 'Converted, but failed to save to chosen folder.';
-        }
+        _status = finalPath != null ? 'Saved: $finalPath' : 'Converted, but failed to save to chosen folder.';
         _progress = 1.0;
         _busy = false;
       });
-
       FlutterForegroundTask.updateService(notificationTitle: 'Done', notificationText: 'Saved successfully');
       WakelockPlus.disable();
       await _stopFgService();
       await _cleanupCaches();
+      if (doTwoPass) opts.useHwEncoder = origHw;
       return;
     }
 
@@ -1109,12 +1185,12 @@ class _ConverterHomeState extends State<ConverterHome> {
 
     WakelockPlus.disable();
     await _stopFgService();
-
     try {
       final f = File(tempOutPath);
       if (await f.exists()) await f.delete();
     } catch (_) {}
     await _cleanupCaches();
+    if (doTwoPass) opts.useHwEncoder = origHw;
   }
 
   String _summarizeFailure(String tail) {
@@ -1368,6 +1444,58 @@ class _ConverterHomeState extends State<ConverterHome> {
           ),
           const SizedBox(height: 12),
 
+          // Two-pass (software only)
+          CheckboxListTile(
+            value: opts.twoPass,
+            onChanged: (_busy || _isLockedByTurbo) ? null : (v) => setState(() => opts.twoPass = v ?? false),
+            title: const Text('Two-pass encoding (software only)'),
+            subtitle: const Text('Disables hardware encoder for this run'),
+          ),
+          const SizedBox(height: 12),
+
+          // Track pickers and mixing
+          if (opts.input.isNotEmpty)
+            Row(
+              children: [
+                Expanded(
+                  child: _Labeled(
+                    label: 'Video stream index',
+                    child: TextField(
+                      keyboardType: TextInputType.number,
+                      onChanged: _busy
+                          ? null
+                          : (v) {
+                              final n = int.tryParse(v.trim());
+                              if (n != null) setState(() => opts.videoStream = n);
+                            },
+                      decoration: InputDecoration(hintText: '0', border: const OutlineInputBorder(), helperText: 'Usually 0', suffixText: '${opts.videoStream}'),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _Labeled(
+                    label: 'Audio stream index (optional)',
+                    child: TextField(
+                      keyboardType: TextInputType.number,
+                      onChanged: _busy
+                          ? null
+                          : (v) {
+                              final n = int.tryParse(v.trim());
+                              setState(() => opts.audioStream = n);
+                            },
+                      decoration: const InputDecoration(hintText: 'auto', border: OutlineInputBorder(), helperText: 'Leave empty for first audio'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          CheckboxListTile(
+            value: opts.allowDownmix,
+            onChanged: _busy ? null : (v) => setState(() => opts.allowDownmix = v ?? true),
+            title: const Text('Allow downmix (e.g., 7.1 → 5.1/2.0 when needed)'),
+          ),
+          const SizedBox(height: 12),
           CheckboxListTile(
             value: opts.toneMapHdrToSdr,
             onChanged: (_busy || _isLockedByTurbo) ? null : (v) => setState(() => opts.toneMapHdrToSdr = v ?? true),
@@ -1391,6 +1519,10 @@ class _ConverterHomeState extends State<ConverterHome> {
               ),
             ],
           ),
+          const SizedBox(height: 24),
+          const Text('Logs', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          const _LogPane(),
           const SizedBox(height: 24),
           const _TipsBox(),
         ],
@@ -1483,6 +1615,31 @@ class _TipsBox extends StatelessWidget {
             Text('• AV1 is efficient but slow to encode on mobile.'),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _LogPane extends StatefulWidget {
+  const _LogPane();
+  @override
+  State<_LogPane> createState() => _LogPaneState();
+}
+
+class _LogPaneState extends State<_LogPane> {
+  @override
+  Widget build(BuildContext context) {
+    final lines = LogBuffer.I.dump();
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 220),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.black26),
+      ),
+      child: SingleChildScrollView(
+        child: SelectableText(lines, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
       ),
     );
   }
