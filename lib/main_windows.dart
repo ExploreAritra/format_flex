@@ -551,6 +551,24 @@ class FfmpegServiceWin {
     return (w: tw.clamp(2, maxW), h: th.clamp(2, maxH));
   }
 
+  // Cheap runtime check for CUDA DLLs (prevents "Cannot load nvcuda.dll").
+  bool _hasCudaRuntime() {
+    try {
+      final winDir = Platform.environment['WINDIR'] ?? r'C:\Windows';
+      final sys32 = p.join(winDir, 'System32');
+      final nvcuda = File(p.join(sys32, 'nvcuda.dll'));
+      final nvencApi = File(p.join(sys32, 'nvEncodeAPI64.dll'));
+      final ok = nvcuda.existsSync() && nvencApi.existsSync();
+      if (!ok) {
+        AppLog.I.i('CUDA runtime not found — will not add -hwaccel cuda');
+      }
+      return ok;
+    } catch (e) {
+      AppLog.I.w('CUDA runtime check failed: $e');
+      return false;
+    }
+  }
+
   /// Build ffmpeg argv list (no shell quoting).
   List<String> buildCommand({
     required String input,
@@ -571,6 +589,7 @@ class FfmpegServiceWin {
 
     final VCodec effV = turbo ? VCodec.h264 : o.vcodec;
     final encName = forceSoftwareEncode ? effV.swName : pickEncoder(effV, requestHw: o.useHwEncoder || turbo);
+    final usingHwEnc = !encName.startsWith('lib');
 
     final vCodecIn = (probe.vCodecName ?? '').toLowerCase();
     final sameCodec =
@@ -585,7 +604,6 @@ class FfmpegServiceWin {
     // ---------- Filters ----------
     final vf = <String>[];
     final preGlobal = <String>[]; // e.g., -init_hw_device opencl=ocl -filter_hw_device ocl
-    final usingHwEnc = !encName.startsWith('lib');
 
     // Tone-map strategy
     final useOpenCLToneMap = hdrToneMapRequested && caps.hasTonemapOpenCL;
@@ -618,24 +636,32 @@ class FfmpegServiceWin {
 
     final vfChain = vf.isEmpty ? null : vf.join(',');
 
-    // ---------- Decoder side (opportunistic) ----------
+    // ---------- Decoder side (opportunistic, but SAFE) ----------
     final preInput = <String>[];
     if (!forceSoftwareDecode && usingHwEnc && !hdrToneMapRequested && !needsScale) {
       if (encName.contains('_nvenc')) {
-        preInput.addAll(['-hwaccel', 'cuda']);
+        final canUseCuda = _hasCudaRuntime();
+        final av1Input = vCodecIn.contains('av1'); // FFmpeg CUDA AV1 decode support varies; dav1d is safer
+        if (canUseCuda && !av1Input) {
+          preInput.addAll(['-hwaccel', 'cuda']);
+          AppLog.I.i('HW decode: ON (-hwaccel cuda)');
+        } else {
+          AppLog.I.i('HW decode: OFF → ${canUseCuda ? "AV1 input; using CPU (dav1d)" : "CUDA DLLs missing"}');
+        }
       } else if (encName.contains('_qsv')) {
         preInput.addAll(['-hwaccel', 'qsv']);
+        AppLog.I.i('HW decode: ON (-hwaccel qsv)');
       } else if (encName.contains('_amf')) {
         preInput.addAll(['-hwaccel', 'd3d11va']);
+        AppLog.I.i('HW decode: ON (-hwaccel d3d11va)');
       }
+    } else {
+      AppLog.I.i('HW decode: OFF (decode on CPU). usingHwEnc=$usingHwEnc hdrToneMap=$hdrToneMapRequested needsScale=$needsScale');
     }
 
     // ---------- Stream selection ----------
     final mapArgs = <String>[];
-    // Video stream (user-chosen index; default 0)
     mapArgs.addAll(['-map', '0:${o.videoStream}']);
-
-    // Audio stream selection: if user picked, map it; else let ffmpeg auto-pick
     if (o.audioStream != null) {
       mapArgs.addAll(['-map', '0:${o.audioStream}']);
     }
@@ -685,20 +711,18 @@ class FfmpegServiceWin {
         switch (effV) {
           case VCodec.h264:
             vArgs.addAll(['-preset', o.turbo ? 'superfast' : 'veryfast', '-profile:v', 'high', '-pix_fmt', 'yuv420p']);
-            if (o.useCrf) {
+            if (o.useCrf)
               vArgs.addAll(['-crf', '${o.crf}']);
-            } else {
+            else
               vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
-            }
             break;
           case VCodec.hevc:
             vArgs.addAll(['-preset', o.turbo ? 'ultrafast' : 'fast', '-pix_fmt', 'yuv420p']);
             if (o.container == ContainerFmt.mp4) vArgs.addAll(['-tag:v', 'hvc1']);
-            if (o.useCrf) {
+            if (o.useCrf)
               vArgs.addAll(['-crf', '${o.crf}']);
-            } else {
+            else
               vArgs.addAll(['-b:v', '${o.vBitrateK}k']);
-            }
             break;
           case VCodec.vp9:
             vArgs.addAll([
@@ -731,12 +755,9 @@ class FfmpegServiceWin {
     // ---------- Audio ----------
     final aArgs = <String>[];
     if (o.acodec == ACodec.copy && o.audioStream == null) {
-      // Explicit copy only safe if user picked a track and we mapped it.
-      // If not picked, fall back to codec-based decision below.
       AppLog.I.w('Audio set to copy but no specific stream selected; falling back to codec-based decision.');
     }
 
-    // determine if we should downmix
     _AudioTrack? srcTrack;
     if (o.audioStream != null) {
       srcTrack = probe.audioTracks.firstWhere(
@@ -746,11 +767,9 @@ class FfmpegServiceWin {
     } else {
       srcTrack = probe.audioTracks.isNotEmpty ? probe.audioTracks.first : null;
     }
-
     final needDownmix = o.allowDownmix && srcTrack != null && srcTrack.channels != null && srcTrack.channels! > o.audioChannels;
 
     if (o.acodec == ACodec.copy && needDownmix) {
-      // can't copy and downmix simultaneously; must re-encode
       AppLog.I.i('Forcing audio re-encode because downmix ${srcTrack?.channels} -> ${o.audioChannels}');
     }
 
@@ -766,16 +785,7 @@ class FfmpegServiceWin {
     if (canCopyAudioCodec && !needDownmix && o.sampleRate <= 0) {
       aArgs.addAll(['-c:a', 'copy']);
     } else {
-      aArgs.addAll([
-        '-c:a',
-        o.acodec == ACodec.copy
-            ? 'aac' // safe default if copy not possible due to downmix or sr change
-            : o.acodec.ffmpegName,
-        '-b:a',
-        '${o.aBitrateK}k',
-        '-ac',
-        '${o.audioChannels}',
-      ]);
+      aArgs.addAll(['-c:a', o.acodec == ACodec.copy ? 'aac' : o.acodec.ffmpegName, '-b:a', '${o.aBitrateK}k', '-ac', '${o.audioChannels}']);
       if (o.sampleRate > 0) aArgs.addAll(['-ar', '${o.sampleRate}']);
     }
 
@@ -786,7 +796,7 @@ class FfmpegServiceWin {
       ...preGlobal,
       '-y',
       '-v',
-      'verbose', // good default; you can lower to info/warning if too chatty
+      'verbose',
       '-hide_banner',
       '-stats_period',
       '0.5',
@@ -843,7 +853,7 @@ class FfmpegServiceWin {
 
   Future<ConvertResult> convert({
     required List<String> args,
-    required void Function(double pct) onProgress,
+    required void Function(double pct, {int? outUs, double? speedX, int? frame}) onProgress,
     required int? durationMs,
     required String outputPath,
     void Function(Process p)? onProcess,
@@ -862,14 +872,18 @@ class FfmpegServiceWin {
 
     onProcess?.call(proc);
 
-    // ---- Progress state (microseconds end-to-end) ----
+    // ---- Progress state ----
     final totalUs = (durationMs ?? 0) > 0 ? durationMs! * 1000 : null;
     int? lastOutUs;
+    int? lastFrame;
+    double? lastFps;
+    double? lastSpeed;
     double lastPct = 0.0;
+    bool sawEnd = false;
 
-    // Kick the bar so it isn’t stuck at 0 during probe/warmup
+    // nudge the bar so it isn’t stuck during warmup
     try {
-      onProgress(0.001);
+      onProgress(0.001, outUs: 0, speedX: null, frame: null);
     } catch (_) {}
 
     // ---- Tail capture + logging ----
@@ -881,48 +895,57 @@ class FfmpegServiceWin {
       AppLog.I.i(s);
     }
 
-    // Robust kv parser: prefer out_time_us, treat out_time_ms as µs (matches your logs)
-    void _parseProgressLine(String line) {
-      // Example keys we care about:
-      //   out_time_us=1376375
-      //   out_time_ms=1376375   <-- some builds also emit microseconds here
-      //   progress=continue|end
+    void _consume(String line) {
+      // Parse -progress key=value
+      // We’ve seen ffmpeg write microseconds to both out_time_us and out_time_ms in some builds.
       if (line.startsWith('out_time_us=')) {
         final v = int.tryParse(line.substring(12).trim());
         if (v != null) lastOutUs = v;
       } else if (line.startsWith('out_time_ms=')) {
         final v = int.tryParse(line.substring(12).trim());
-        if (v != null) lastOutUs = v; // treat as microseconds to avoid 1000x fast bar
+        if (v != null) lastOutUs = v; // treat as µs like in your logs
+      } else if (line.startsWith('frame=')) {
+        lastFrame = int.tryParse(line.substring(6).trim());
+      } else if (line.startsWith('fps=')) {
+        lastFps = double.tryParse(line.substring(4).trim());
+      } else if (line.startsWith('speed=')) {
+        final s = line.substring(6).trim(); // e.g. "2.67x"
+        lastSpeed = double.tryParse(s.replaceAll('x', '').trim());
       } else if (line.startsWith('progress=')) {
         final state = line.substring(9).trim();
         if (state == 'end') {
-          // Force 100% on natural end
-          try {
-            onProgress(1.0);
-          } catch (_) {}
-          lastPct = 1.0;
+          sawEnd = true;
         }
+      }
+
+      // Emit progress updates
+      if (totalUs != null && totalUs > 0 && lastOutUs != null) {
+        double pct = (lastOutUs! / totalUs).clamp(0.0, 1.0);
+        if (pct < lastPct) pct = lastPct; // monotonic
+        if (pct >= 0.999 && !sawEnd) pct = 0.999; // don’t hit 100% until end
+        lastPct = pct;
+        try {
+          onProgress(pct, outUs: lastOutUs, speedX: lastSpeed, frame: lastFrame);
+        } catch (_) {}
+      }
+
+      if (sawEnd && lastPct < 1.0) {
+        try {
+          onProgress(1.0, outUs: lastOutUs, speedX: lastSpeed, frame: lastFrame);
+        } catch (_) {}
+        lastPct = 1.0;
       }
     }
 
     proc.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
       _add('[ffmpeg-out] $line');
-      _parseProgressLine(line);
-
-      if (totalUs != null && totalUs > 0 && lastOutUs != null) {
-        double pct = (lastOutUs! / totalUs).clamp(0.0, 1.0);
-        // Monotonic & no silly jumps backward/forward
-        if (pct < lastPct) pct = lastPct;
-        // Avoid premature 100% unless we saw progress=end
-        if (pct >= 0.999 && lastPct < 0.999) pct = 0.999;
-        lastPct = pct;
-        try {
-          onProgress(pct);
-        } catch (_) {}
-      }
+      _consume(line);
     });
 
-    proc.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen((line) => _add('[ffmpeg-err] $line'));
+    proc.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
+      _add('[ffmpeg-err] $line');
+      _consume(line); // some builds emit progress keys on stderr
+    });
 
     final code = await proc.exitCode;
     AppLog.I.i('FFmpeg exited with code $code');
@@ -947,10 +970,9 @@ class FfmpegServiceWin {
       AppLog.I.e('Failed to validate output "$outputPath": $e');
     }
 
-    // If ffmpeg ended successfully but progress never reached 100, finish it.
     if (ok && lastPct < 1.0) {
       try {
-        onProgress(1.0);
+        onProgress(1.0, outUs: lastOutUs, speedX: lastSpeed, frame: lastFrame);
       } catch (_) {}
     }
 
@@ -1222,7 +1244,18 @@ class _ConverterHomeState extends State<ConverterHome> {
         ..allowDownmix = opts.allowDownmix;
 
       final args2 = svc.buildCommand(input: opts.input, output: tempOut, probe: probe, o: soft, forceSoftwareDecode: true, forceSoftwareEncode: true);
-      final res2 = await svc.convert(args: args2, onProgress: (p) => setState(() => _progress = p), durationMs: _durationMs, outputPath: tempOut, onProcess: (p) => _active = p);
+      final res2 = await svc.convert(
+        args: args2,
+        onProgress: (pct, {outUs, speedX, frame}) {
+          setState(() {
+            _progress = pct;
+            _status = _prettyProgress(outUs, _durationMs, speedX);
+          });
+        },
+        durationMs: _durationMs,
+        outputPath: tempOut,
+        onProcess: (p) => _active = p,
+      );
       _lastCmd = res2.executedCmd;
       ok = res2.ok;
       finalRes = res2;
