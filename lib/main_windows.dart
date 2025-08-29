@@ -956,7 +956,7 @@ class ConverterApp extends StatelessWidget {
     return MaterialApp(
       title: 'Universal Video Converter (Windows)',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.redAccent),
       home: const ConverterHome(),
     );
   }
