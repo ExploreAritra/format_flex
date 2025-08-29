@@ -436,15 +436,6 @@ class ConvertResult {
   ConvertResult({required this.ok, required this.cancelled, required this.returnCode, required this.tailLog, required this.executedCmd});
 }
 
-class _FfmpegProg {
-  int? outUs; // microseconds
-  int? totalSize;
-  int? frame;
-  double? fps;
-  double? speedX;
-  String? state; // continue | end
-}
-
 /// =============================================================
 /// FFmpeg service (Windows)
 /// =============================================================
@@ -770,7 +761,7 @@ class FfmpegServiceWin {
     final needDownmix = o.allowDownmix && srcTrack != null && srcTrack.channels != null && srcTrack.channels! > o.audioChannels;
 
     if (o.acodec == ACodec.copy && needDownmix) {
-      AppLog.I.i('Forcing audio re-encode because downmix ${srcTrack?.channels} -> ${o.audioChannels}');
+      AppLog.I.i('Forcing audio re-encode because downmix ${srcTrack.channels} -> ${o.audioChannels}');
     }
 
     final canCopyAudioCodec =
@@ -819,38 +810,6 @@ class FfmpegServiceWin {
     return args;
   }
 
-  // Parse ffmpeg -progress key=value lines; return out_time_ms
-  static int? _parseProgressLine(String line) {
-    if (line.startsWith('out_time_ms=')) {
-      final v = int.tryParse(line.split('=').last.trim());
-      return v;
-    }
-    return null;
-  }
-
-  _FfmpegProg _parseProgressKV(String line, _FfmpegProg cur) {
-    if (line.startsWith('out_time_us=')) {
-      final v = int.tryParse(line.substring(12).trim());
-      if (v != null) cur.outUs = v;
-    } else if (line.startsWith('out_time_ms=')) {
-      // Some builds output microseconds here too (like your log).
-      final v = int.tryParse(line.substring(12).trim());
-      if (v != null) cur.outUs = v; // treat as microseconds to match observed behavior
-    } else if (line.startsWith('total_size=')) {
-      cur.totalSize = int.tryParse(line.substring(11).trim());
-    } else if (line.startsWith('frame=')) {
-      cur.frame = int.tryParse(line.substring(6).trim());
-    } else if (line.startsWith('fps=')) {
-      cur.fps = double.tryParse(line.substring(4).trim());
-    } else if (line.startsWith('speed=')) {
-      final s = line.substring(6).trim(); // e.g., "2.67x"
-      cur.speedX = double.tryParse(s.replaceAll('x', '').trim());
-    } else if (line.startsWith('progress=')) {
-      cur.state = line.substring(9).trim(); // continue | end
-    }
-    return cur;
-  }
-
   Future<ConvertResult> convert({
     required List<String> args,
     required void Function(double pct, {int? outUs, double? speedX, int? frame}) onProgress,
@@ -888,14 +847,14 @@ class FfmpegServiceWin {
 
     // ---- Tail capture + logging ----
     final tail = <String>[];
-    void _add(String s) {
+    void add(String s) {
       if (s.isEmpty) return;
       tail.add(s);
       if (tail.length > 400) tail.removeAt(0);
       AppLog.I.i(s);
     }
 
-    void _consume(String line) {
+    void consume(String line) {
       // Parse -progress key=value
       // We’ve seen ffmpeg write microseconds to both out_time_us and out_time_ms in some builds.
       if (line.startsWith('out_time_us=')) {
@@ -938,13 +897,13 @@ class FfmpegServiceWin {
     }
 
     proc.stdout.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
-      _add('[ffmpeg-out] $line');
-      _consume(line);
+      add('[ffmpeg-out] $line');
+      consume(line);
     });
 
     proc.stderr.transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
-      _add('[ffmpeg-err] $line');
-      _consume(line); // some builds emit progress keys on stderr
+      add('[ffmpeg-err] $line');
+      consume(line); // some builds emit progress keys on stderr
     });
 
     final code = await proc.exitCode;
@@ -1026,7 +985,7 @@ class _ConverterHomeState extends State<ConverterHome> {
 
   // Finds "<exe_dir>\ffmpeg\bin" or nearby
   String? findBundledFfmpegBin() {
-    String? _hit(String dir) {
+    String? hit0(String dir) {
       final ff = File(p.join(dir, 'ffmpeg.exe'));
       final fp = File(p.join(dir, 'ffprobe.exe'));
       return (ff.existsSync() && fp.existsSync()) ? p.normalize(dir) : null;
@@ -1038,7 +997,7 @@ class _ConverterHomeState extends State<ConverterHome> {
     final candidates = <String>[p.join(exeDir, 'ffmpeg', 'bin'), p.join(exeDir, '..', 'ffmpeg', 'bin'), p.join(exeDir, '..', '..', 'ffmpeg', 'bin'), p.join(cwd, 'ffmpeg', 'bin')];
 
     for (final c in candidates) {
-      final hit = _hit(c);
+      final hit = hit0(c);
       if (hit != null) return hit;
     }
     return null;
@@ -1770,7 +1729,7 @@ class _LogTail extends StatelessWidget {
       constraints: const BoxConstraints(maxHeight: 220),
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: Colors.black.withOpacity(.07),
+        color: Colors.black.withValues(alpha: 0.07),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: Colors.black26),
       ),
